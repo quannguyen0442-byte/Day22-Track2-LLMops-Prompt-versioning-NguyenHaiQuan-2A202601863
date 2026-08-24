@@ -10,6 +10,7 @@ NHIỆM VỤ:
 DELIVERABLE: Mở https://smith.langchain.com → project của bạn → xác nhận ≥ 50 traces.
 """
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -24,8 +25,67 @@ from langchain_core.runnables import RunnablePassthrough
 from langsmith import traceable
 
 from utils.llm_factory import get_llm, get_embeddings
-from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
+from utils.data_loader import load_knowledge_base, split_text
 from qa_pairs import SAMPLE_QUESTIONS
+
+# Cache FAISS index cục bộ (đường dẫn tương đối, không commit — xem .gitignore).
+# NV1/NV2/NV3 đều embed đúng 107 chunks giống hệt nhau; không cache thì mỗi lần
+# chạy lại tốn thêm ~107 lượt gọi embedding, dễ chạm giới hạn free tier theo ngày.
+_FAISS_CACHE_DIR = Path(__file__).parent.parent / "data" / ".faiss_cache"
+
+
+def _build_vectorstore_with_retry(chunks, embeddings, batch_size: int = 50, max_retries: int = 5):
+    """
+    Dựng FAISS vectorstore theo từng lô nhỏ (mặc định 50 chunks/lô) thay vì gộp
+    hết vào một lần gọi embed_documents().
+
+    Lý do: free tier của Gemini giới hạn ~100 đoạn văn bản được embed mỗi phút.
+    Gộp toàn bộ chunks vào 1 lần gọi thì bị vượt giới hạn NGAY TRONG lần gọi đó
+    (không phải do gọi dồn dập nhiều lần) — nên retry/chờ không giải quyết được,
+    phải giảm số lượng văn bản mỗi lần gọi xuống dưới ngưỡng.
+
+    Có cache trên đĩa: nếu đã dựng trước đó (bởi NV1/NV2/NV3 bất kỳ), đọc lại từ
+    data/.faiss_cache/ thay vì gọi embedding lại, để không tốn thêm quota.
+    """
+    from langchain_community.vectorstores import FAISS
+
+    if _FAISS_CACHE_DIR.exists():
+        try:
+            vectorstore = FAISS.load_local(
+                str(_FAISS_CACHE_DIR), embeddings, allow_dangerous_deserialization=True
+            )
+            print(f"  💾 Đã tải FAISS index từ cache ({_FAISS_CACHE_DIR}) — không tốn quota embedding")
+            return vectorstore
+        except Exception as e:
+            print(f"  ⚠️  Cache lỗi ({e}), dựng lại từ đầu")
+
+    batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
+    vectorstore = None
+    for bi, batch in enumerate(batches, 1):
+        for attempt in range(1, max_retries + 1):
+            try:
+                if vectorstore is None:
+                    vectorstore = FAISS.from_texts(batch, embeddings)
+                else:
+                    vectorstore.add_texts(batch)
+                print(f"  ✅ Lô {bi}/{len(batches)} đã embed xong ({len(batch)} chunks)")
+                break
+            except Exception as e:
+                msg = str(e)
+                is_rate_limit = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+                if not is_rate_limit or attempt == max_retries:
+                    raise
+                print(f"  ⏳ Dính rate-limit ở lô {bi} (lần {attempt}/{max_retries}), chờ 65s...")
+                time.sleep(65)
+
+    try:
+        _FAISS_CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
+        vectorstore.save_local(str(_FAISS_CACHE_DIR))
+        print(f"  💾 Đã lưu FAISS index vào cache để lần chạy sau không tốn quota embedding")
+    except Exception as e:
+        print(f"  ⚠️  Không lưu được cache ({e}), bỏ qua")
+
+    return vectorstore
 
 
 # ── 1. Thiết lập Vectorstore ───────────────────────────────────────────────
@@ -39,28 +99,22 @@ def setup_vectorstore():
         chunks      = split_text(text, chunk_size=500, chunk_overlap=50)
         vectorstore = build_vectorstore(chunks, embeddings)
     """
-    # TODO: Khởi tạo embeddings từ factory (1 dòng)
-    embeddings = ...
+    embeddings = get_embeddings()
 
-    # TODO: Đọc nội dung knowledge base (1 dòng)
-    text = ...
+    text = load_knowledge_base()
 
-    # TODO: Chia text thành chunks với chunk_size=500, chunk_overlap=50 (1 dòng)
-    chunks = ...
+    chunks = split_text(text, chunk_size=500, chunk_overlap=50)
     print(f"📚 Đã chia thành {len(chunks)} chunks")
 
-    # TODO: Tạo FAISS vectorstore và trả về (1 dòng)
-    vectorstore = ...
+    vectorstore = _build_vectorstore_with_retry(chunks, embeddings)
     return vectorstore
 
 
 # ── 2. RAG Prompt Template ─────────────────────────────────────────────────
-# TODO: Tạo ChatPromptTemplate với 2 messages:
-#   ("system", "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời.\n\nContext:\n{context}")
-#   ("human",  "{question}")
-#
-# Gợi ý: RAG_PROMPT = ChatPromptTemplate.from_messages([...])
-RAG_PROMPT = ...
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời.\n\nContext:\n{context}"),
+    ("human",  "{question}"),
+])
 
 
 # ── 3. Build RAG Chain ─────────────────────────────────────────────────────
@@ -76,36 +130,44 @@ def build_rag_chain(vectorstore):
     """
     llm = get_llm()
 
-    # TODO: Tạo retriever từ vectorstore, lấy k=3 tài liệu gần nhất
-    # Gợi ý: retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    retriever = ...
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    # TODO: Định nghĩa hàm format_docs để ghép page_content của các docs thành 1 chuỗi
-    # Gợi ý: "\n\n".join(doc.page_content for doc in docs)
     def format_docs(docs):
-        ...
+        """Ghép nội dung các Document thành một khối text cho biến {context}."""
+        return "\n\n".join(doc.page_content for doc in docs)
 
-    # TODO: Xây dựng LCEL chain dùng pipe operator (|)
-    # Gợi ý:
-    #   chain = (
-    #       {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    #       | RAG_PROMPT | llm | StrOutputParser()
-    #   )
-    chain = ...
+    # Dict ở đầu chain chạy song song hai nhánh trên cùng một input:
+    # nhánh context đi qua retriever rồi format_docs, nhánh question giữ nguyên câu hỏi
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
+    )
 
     return chain, retriever
 
 
 # ── 4. Hàm Query có LangSmith Tracing ─────────────────────────────────────
-# TODO: Thêm decorator @traceable(name="rag-query", tags=["rag", "step1"])
-#       phía TRÊN chữ ký hàm để LangSmith tự động ghi lại input/output/latency
-def ask(chain, question: str) -> str:
+@traceable(name="rag-query", tags=["rag", "step1"])
+def ask(chain, question: str, max_retries: int = 5) -> str:
     """
     Chạy RAG chain với một câu hỏi.
     Decorator @traceable sẽ gửi mỗi lần gọi lên LangSmith như một trace riêng.
+
+    Có retry cho lỗi 429 (rate-limit) vì free tier của provider miễn phí
+    thường giới hạn theo request/phút — 50 câu hỏi liên tiếp có thể chạm giới hạn.
     """
-    # TODO: Gọi chain.invoke(question) và trả về kết quả
-    ...
+    for attempt in range(1, max_retries + 1):
+        try:
+            return chain.invoke(question)
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+            if not is_rate_limit or attempt == max_retries:
+                raise
+            print(f"    ⏳ Dính rate-limit (lần {attempt}/{max_retries}), chờ 65s...")
+            time.sleep(65)
 
 
 # ── 5. Main ────────────────────────────────────────────────────────────────
@@ -117,15 +179,12 @@ def main():
     if not config.validate():
         sys.exit(1)
 
-    # TODO: Gọi setup_vectorstore() để tạo vectorstore
-    vectorstore = ...
+    vectorstore = setup_vectorstore()
 
-    # TODO: Gọi build_rag_chain(vectorstore) để nhận chain và retriever
-    chain, retriever = ...
+    chain, retriever = build_rag_chain(vectorstore)
 
-    # TODO: Lặp qua tất cả SAMPLE_QUESTIONS, gọi ask(), in câu hỏi và câu trả lời
     for i, question in enumerate(SAMPLE_QUESTIONS, 1):
-        answer = ...
+        answer = ask(chain, question)
         print(f"[{i:02d}/{len(SAMPLE_QUESTIONS)}] Q: {question[:60]}")
         print(f"       A: {str(answer)[:100]}\n")
 

@@ -28,3 +28,7 @@ env/
 
 # Lab outputs (không commit, chỉ nộp evidence/)
 data/ragas_report.json
+
+# Cache FAISS index cục bộ — dựng lại được từ data/knowledge_base.txt,
+# không phải thứ đề bài yêu cầu nộp, chỉ để đỡ tốn quota embedding khi chạy lại
+data/.faiss_cache/
