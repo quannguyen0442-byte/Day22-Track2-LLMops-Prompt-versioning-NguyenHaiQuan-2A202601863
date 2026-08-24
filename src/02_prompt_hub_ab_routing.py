@@ -11,6 +11,7 @@ NHIỆM VỤ:
 DELIVERABLE: 2 prompt version hiển thị trong Prompt Hub trên https://smith.langchain.com
 """
 import sys
+import time
 import hashlib
 from pathlib import Path
 
@@ -23,8 +24,63 @@ from langchain_core.output_parsers import StrOutputParser
 from langsmith import Client, traceable
 
 from utils.llm_factory import get_llm, get_embeddings
-from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
+from utils.data_loader import load_knowledge_base, split_text
 from qa_pairs import SAMPLE_QUESTIONS
+
+# Cache FAISS index cục bộ (đường dẫn tương đối, không commit — xem .gitignore).
+# NV1/NV2/NV3 đều embed đúng 107 chunks giống hệt nhau; không cache thì mỗi lần
+# chạy lại tốn thêm ~107 lượt gọi embedding, dễ chạm giới hạn free tier theo ngày.
+_FAISS_CACHE_DIR = Path(__file__).parent.parent / "data" / ".faiss_cache"
+
+
+def _build_vectorstore_with_retry(chunks, embeddings, batch_size: int = 50, max_retries: int = 5):
+    """
+    Dựng FAISS vectorstore theo từng lô nhỏ để tránh vượt giới hạn free tier
+    (~100 đoạn văn bản embed/phút của Gemini). Xem giải thích chi tiết ở
+    01_langsmith_rag_pipeline.py.
+
+    Có cache trên đĩa: nếu đã dựng trước đó (bởi NV1/NV2/NV3 bất kỳ), đọc lại từ
+    data/.faiss_cache/ thay vì gọi embedding lại, để không tốn thêm quota.
+    """
+    from langchain_community.vectorstores import FAISS
+
+    if _FAISS_CACHE_DIR.exists():
+        try:
+            vectorstore = FAISS.load_local(
+                str(_FAISS_CACHE_DIR), embeddings, allow_dangerous_deserialization=True
+            )
+            print(f"  💾 Đã tải FAISS index từ cache ({_FAISS_CACHE_DIR}) — không tốn quota embedding")
+            return vectorstore
+        except Exception as e:
+            print(f"  ⚠️  Cache lỗi ({e}), dựng lại từ đầu")
+
+    batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
+    vectorstore = None
+    for bi, batch in enumerate(batches, 1):
+        for attempt in range(1, max_retries + 1):
+            try:
+                if vectorstore is None:
+                    vectorstore = FAISS.from_texts(batch, embeddings)
+                else:
+                    vectorstore.add_texts(batch)
+                print(f"  ✅ Lô {bi}/{len(batches)} đã embed xong ({len(batch)} chunks)")
+                break
+            except Exception as e:
+                msg = str(e)
+                is_rate_limit = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+                if not is_rate_limit or attempt == max_retries:
+                    raise
+                print(f"  ⏳ Dính rate-limit ở lô {bi} (lần {attempt}/{max_retries}), chờ 65s...")
+                time.sleep(65)
+
+    try:
+        _FAISS_CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
+        vectorstore.save_local(str(_FAISS_CACHE_DIR))
+        print(f"  💾 Đã lưu FAISS index vào cache để lần chạy sau không tốn quota embedding")
+    except Exception as e:
+        print(f"  ⚠️  Không lưu được cache ({e}), bỏ qua")
+
+    return vectorstore
 
 
 # ── 1. Tên Prompt trên Hub ─────────────────────────────────────────────────
@@ -158,10 +214,22 @@ def ask_ab(retriever, llm, prompt, question: str, version: str) -> dict:
     context = "\n\n".join(doc.page_content for doc in docs)
 
     # Retrieve nằm trong hàm được @traceable bọc, nên trace trên LangSmith
-    # chứa cả câu hỏi, context truy xuất được lẫn câu trả lời
-    answer = (prompt | llm | StrOutputParser()).invoke(
-        {"context": context, "question": question}
-    )
+    # chứa cả câu hỏi, context truy xuất được lẫn câu trả lời.
+    # Có retry cho lỗi 429 (rate-limit) vì free tier có thể chạm giới hạn
+    # khi chạy liên tiếp 50 câu hỏi.
+    chain = prompt | llm | StrOutputParser()
+    answer = None
+    for attempt in range(1, 6):
+        try:
+            answer = chain.invoke({"context": context, "question": question})
+            break
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = "RESOURCE_EXHAUSTED" in msg or "429" in msg
+            if not is_rate_limit or attempt == 5:
+                raise
+            print(f"    ⏳ Dính rate-limit (lần {attempt}/5), chờ 65s...")
+            time.sleep(65)
 
     return {"question": question, "answer": answer, "version": version}
 
@@ -171,7 +239,7 @@ def setup_vectorstore():
     embeddings  = get_embeddings()
     text        = load_knowledge_base()
     chunks      = split_text(text)
-    return build_vectorstore(chunks, embeddings)
+    return _build_vectorstore_with_retry(chunks, embeddings)
 
 
 # ── 8. Main ────────────────────────────────────────────────────────────────
